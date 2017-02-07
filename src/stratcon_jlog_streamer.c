@@ -45,6 +45,9 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 
+#include <libxml/parser.h>
+#include <libxml/xpath.h>
+
 #include <eventer/eventer.h>
 #include <mtev_conf.h>
 #include <mtev_hash.h>
@@ -52,6 +55,7 @@
 #include <mtev_getip.h>
 #include <mtev_rest.h>
 #include <mtev_json.h>
+#include <mtev_capabilities_listener.h>
 
 #include "noit_mtev_bridge.h"
 #include "stratcon_dtrace_probes.h"
@@ -74,7 +78,9 @@ static struct timeval DEFAULT_NOIT_PERIOD_TV = { 5UL, 0UL };
 static const char *feed_type_to_str(int jlog_feed_cmd) {
   switch(jlog_feed_cmd) {
     case NOIT_JLOG_DATA_FEED: return "durable/storage";
+    case NOIT_JLOG_DATA_FEED_COMP: return "durable/storage";
     case NOIT_JLOG_DATA_TEMP_FEED: return "transient/iep";
+    case NOIT_JLOG_DATA_TEMP_FEED_COMP: return "transient/iep";
   }
   return "unknown";
 }
@@ -186,6 +192,8 @@ nc_print_noit_conn_brief(mtev_console_closure_t ncct,
       const char *state = "unknown";
 
       switch(jctx->state) {
+        case JLOG_STREAMER_WANT_DISCOVER_ASK: state = "discover-ask"; break;
+        case JLOG_STREAMER_WANT_DISCOVER: state = "discover"; break;
         case JLOG_STREAMER_WANT_INITIATE: state = "initiate"; break;
         case JLOG_STREAMER_WANT_COUNT: state = "waiting for next batch"; break;
         case JLOG_STREAMER_WANT_ERROR: state = "waiting for error"; break;
@@ -300,6 +308,50 @@ __read_on_ctx(eventer_t e, jlog_streamer_ctx_t *ctx, int *newmask) {
   } \
 } while(0)
 
+static uint32_t
+extract_best_capa_feed(uint32_t suggest, const char *buff, int len) {
+  uint32_t cmd_capa, hopeful_capa;
+
+  /* Let's use the lowest common cmd based on class,
+   * if we don't know the class, just return the suggestion. */
+  if(IS_NOIT_JLOG_DATA_FEED(suggest)) {
+    cmd_capa = NOIT_JLOG_DATA_FEED;
+    hopeful_capa = NOIT_JLOG_DATA_FEED_COMP;
+  }
+  else if(IS_NOIT_JLOG_DATA_TEMP_FEED(suggest)) {
+    cmd_capa = NOIT_JLOG_DATA_TEMP_FEED;
+    hopeful_capa = NOIT_JLOG_DATA_TEMP_FEED_COMP;
+  }
+  else return suggest;
+
+  /* document has to be a reasnable length, it is impossible to have a useful
+   * capa document less that 700 bytes. */
+  if(len < 700) return cmd_capa;
+
+  xmlDocPtr doc;
+  char xpath_expr[128];
+  doc = xmlParseMemory(buff, len);
+  if(!doc) return cmd_capa;
+  xmlXPathContextPtr ctxt = NULL;
+  xmlXPathObjectPtr pobj = NULL;
+  ctxt = xmlXPathNewContext(doc);
+
+  /* Look for better commands */
+  snprintf(xpath_expr, sizeof(xpath_expr),
+           "//command[@code=\"0x%08x\"", hopeful_capa);
+  pobj = xmlXPathEval((xmlChar *)xpath_expr, ctxt);
+  if(pobj && pobj->type == XPATH_NODESET &&
+     !xmlXPathNodeSetIsEmpty(pobj->nodesetval)) {
+    /* Found it, use the hopeful command */
+    cmd_capa = hopeful_capa;
+  }
+
+  if(ctxt) xmlXPathFreeContext(ctxt);
+  if(pobj) xmlXPathFreeObject(pobj);
+  xmlFreeDoc(doc);
+  return cmd_capa;
+}
+
 int
 stratcon_jlog_recv_handler(eventer_t e, int mask, void *closure,
                            struct timeval *now) {
@@ -317,7 +369,7 @@ stratcon_jlog_recv_handler(eventer_t e, int mask, void *closure,
       mtevL(noit_error, "[%s] [%s] socket error: %s\n", nctx->remote_str ? nctx->remote_str : "(null)", 
             nctx->remote_cn ? nctx->remote_cn : "(null)", strerror(errno));
  socket_error:
-    ctx->state = JLOG_STREAMER_WANT_INITIATE;
+    ctx->state = JLOG_STREAMER_WANT_DISCOVER_ASK;
     ctx->count = 0;
     ctx->needs_chkpt = 0;
     ctx->bytes_read = 0;
@@ -332,7 +384,62 @@ stratcon_jlog_recv_handler(eventer_t e, int mask, void *closure,
   mtev_connection_update_timeout(nctx);
   while(1) {
     switch(ctx->state) {
+      case JLOG_STREAMER_WANT_DISCOVER_ASK:
+
+        /* if we've already discovered... skip to initiate */
+        if(ctx->jlog_feed_cmd_capa != 0) {
+          ctx->state = JLOG_STREAMER_WANT_INITIATE;
+          continue;
+        }
+        uint32_t capacmd = htonl(MTEV_CAPABILITIES_SERVICE);
+        len = e->opset->write(e->fd, &capacmd, sizeof(capacmd),
+                              &mask, e);
+        if(len < 0) {
+          if(errno == EAGAIN) return mask | EVENTER_EXCEPTION;
+          mtevL(noit_error, "[%s] [%s] initiating capa request failed -> %d/%s.\n", 
+                nctx->remote_str ? nctx->remote_str : "(null)", nctx->remote_cn ? nctx->remote_cn : "(null)", errno, strerror(errno));
+          goto socket_error;
+        }
+        if(len != sizeof(capacmd)) {
+          mtevL(noit_error, "[%s] [%s] short write [%d/%d] on capa request.\n", 
+                nctx->remote_str ? nctx->remote_str : "(null)", nctx->remote_cn ? nctx->remote_cn : "(null)",
+                (int)len, (int)sizeof(ctx->jlog_feed_cmd));
+          goto socket_error;
+        }
+        ctx->state = JLOG_STREAMER_WANT_DISCOVER;
+        /* fallthru */
+      case JLOG_STREAMER_WANT_DISCOVER:
+        if(!ctx->buffer) {
+          ctx->bytes_expected = 16384;
+          ctx->buffer = malloc(ctx->bytes_expected);
+          ctx->bytes_read = 0;
+        }
+        while(0 != (len = e->opset->read(e->fd, ctx->buffer,
+                                         ctx->bytes_expected - ctx->bytes_read,
+                                         &mask, e))) {
+          if(len < 0) {
+            if(errno == EAGAIN) return mask | EVENTER_EXCEPTION;
+            break; /* attempt a document parse */
+          }
+          ctx->bytes_read += len;
+          if(ctx->bytes_read == ctx->bytes_expected) {
+            /* buffer full, grow */
+            ctx->bytes_expected += 16384;
+            char *newbuff = realloc(ctx->buffer, ctx->bytes_expected);
+            if(newbuff == NULL) {
+              mtevL(noit_error, "[%s] [%s] reading capa realloc failed.\n",
+                  nctx->remote_str ? nctx->remote_str : "(null)", nctx->remote_cn ? nctx->remote_cn : "(null)");
+              goto socket_error;
+            }
+            ctx->buffer = newbuff;
+          }
+        }
+        ctx->jlog_feed_cmd_capa = extract_best_capa_feed(ctx->jlog_feed_cmd, ctx->buffer, ctx->bytes_read);
+        goto socket_error; /* not an error, but we need to make a new connection now */
+
       case JLOG_STREAMER_WANT_INITIATE:
+        ctx->jlog_feed_cmd = ctx->jlog_feed_cmd_capa;
+        ctx->jlog_feed_cmd_capa = 0; /* reset for future rediscovery */
         len = e->opset->write(e->fd, &ctx->jlog_feed_cmd,
                               sizeof(ctx->jlog_feed_cmd),
                               &mask, e);
@@ -875,6 +982,8 @@ rest_show_noits_json(mtev_http_rest_closure_t *restc,
         json_object_object_add(node, "remote_cn", json_object_new_string(ctx->remote_cn));
   
       switch(jctx->state) {
+        case JLOG_STREAMER_WANT_DISCOVER_ASK: state = "discover-ask"; break;
+        case JLOG_STREAMER_WANT_DISCOVER: state = "discover"; break;
         case JLOG_STREAMER_WANT_INITIATE: state = "initiate"; break;
         case JLOG_STREAMER_WANT_COUNT: state = "waiting for next batch"; break;
         case JLOG_STREAMER_WANT_ERROR: state = "waiting for error"; break;
@@ -1101,6 +1210,8 @@ rest_show_noits(mtev_http_rest_closure_t *restc,
         xmlSetProp(node, (xmlChar *)"remote_cn", (xmlChar *)ctx->remote_cn);
   
       switch(jctx->state) {
+        case JLOG_STREAMER_WANT_DISCOVER_ASK: state = "discover-ask"; break;
+        case JLOG_STREAMER_WANT_DISCOVER: state = "discover"; break;
         case JLOG_STREAMER_WANT_INITIATE: state = "initiate"; break;
         case JLOG_STREAMER_WANT_COUNT: state = "waiting for next batch"; break;
         case JLOG_STREAMER_WANT_ERROR: state = "waiting for error"; break;

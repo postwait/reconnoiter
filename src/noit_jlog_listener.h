@@ -38,7 +38,11 @@
 #include <eventer/eventer.h>
 
 #define NOIT_JLOG_DATA_FEED 0xda7afeed
+#define NOIT_JLOG_DATA_FEED_COMP 0xda7afeec
 #define NOIT_JLOG_DATA_TEMP_FEED 0x7e66feed
+#define NOIT_JLOG_DATA_TEMP_FEED_COMP 0x7e66feec
+#define IS_NOIT_JLOG_DATA_FEED(a) ((a) == NOIT_JLOG_DATA_FEED || (a) == NOIT_JLOG_DATA_FEED_COMP)
+#define IS_NOIT_JLOG_DATA_TEMP_FEED(a) ((a) == NOIT_JLOG_DATA_TEMP_FEED || (a) == NOIT_JLOG_DATA_TEMP_FEED_COMP)
 
 typedef struct {
   char *feed_name;

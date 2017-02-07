@@ -47,18 +47,21 @@
 
 typedef struct jlog_streamer_ctx_t {
   uint32_t jlog_feed_cmd;
+  uint32_t jlog_feed_cmd_capa;
   int bytes_expected;
   int bytes_read;
   char *buffer;         /* These guys are for doing partial reads */
 
   enum {
-    JLOG_STREAMER_WANT_INITIATE = 0,
-    JLOG_STREAMER_WANT_COUNT = 1,
-    JLOG_STREAMER_WANT_HEADER = 2,
-    JLOG_STREAMER_WANT_BODY = 3,
-    JLOG_STREAMER_IS_ASYNC = 4,
-    JLOG_STREAMER_WANT_CHKPT = 5,
-    JLOG_STREAMER_WANT_ERROR = 6,
+    JLOG_STREAMER_WANT_DISCOVER_ASK = 0,
+    JLOG_STREAMER_WANT_DISCOVER = 1,
+    JLOG_STREAMER_WANT_INITIATE = 2,
+    JLOG_STREAMER_WANT_COUNT = 3,
+    JLOG_STREAMER_WANT_HEADER = 4,
+    JLOG_STREAMER_WANT_BODY = 5,
+    JLOG_STREAMER_IS_ASYNC = 6,
+    JLOG_STREAMER_WANT_CHKPT = 7,
+    JLOG_STREAMER_WANT_ERROR = 8
   } state;
   int count;            /* Number of jlog messages we need to read */
   int needs_chkpt;
